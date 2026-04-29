@@ -1,0 +1,8 @@
+# Ignore the /tools directory
+tools
+
+# Ignore the /results directory
+results
+
+# Ignore the /data directory
+data
