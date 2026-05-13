@@ -10,3 +10,6 @@ data
 
 # Ignore all the virtual environments for the workflows
 *_env/
+
+# Ignore the __pycache__
+__pycache__

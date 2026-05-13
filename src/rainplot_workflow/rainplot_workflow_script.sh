@@ -7,25 +7,28 @@
 #SBATCH --time=02:00:00
 #SBATCH --partition=normal
 
+set -euo pipefail
+
 module load python/3.13.7
 module load samtools
 module load R/4.5.2
 
-# --- Directory structure ---
+# ------------------------------------------------------------------
+# Directory structure
 # workflows/
 # ├── data/
 # │   ├── bam/
 # │   ├── bed/
 # │   ├── sorted_bam/
 # │   ├── index_sorted_bam_bai/
-# │   ├── liftover_chains/
-# │   └── ncbi/
+# │   ├── ncbi/
+# │   └── references/
 # ├── src/
 # │   ├── rainplot_workflow/
 # │   └── utils/
-# ├── tools/
 # └── results/
 #     └── rainplot_results/
+# ------------------------------------------------------------------
 
 WORKFLOW_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -34,13 +37,13 @@ BED_DIR="$WORKFLOW_ROOT/data/bed"
 SORTED_BAM_DIR="$WORKFLOW_ROOT/data/sorted_bam"
 INDEX_DIR="$WORKFLOW_ROOT/data/index_sorted_bam_bai"
 CHAIN_DIR="$WORKFLOW_ROOT/data/liftover_chains"
-NCBI_DIR="$WORKFLOW_ROOT/data/ncbi"
+NCBI_DIR="$WORKFLOW_ROOT/data/ncbi/sacCer3"
 SRC_DIR="$WORKFLOW_ROOT/src/rainplot_workflow"
 UTILS_DIR="$WORKFLOW_ROOT/src/utils"
 TOOLS_DIR="$WORKFLOW_ROOT/tools"
 RESULTS_DIR="$WORKFLOW_ROOT/results/rainplot_results"
-GFF_FILE="$NCBI_DIR/sacCer3/genomic.gff"
 
+NCBI_GFF="$NCBI_DIR/genomic.gff"
 LIFTOVER_BIN="$TOOLS_DIR/liftOver"
 LIFTOVER_URL="https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/liftOver"
 
@@ -68,11 +71,11 @@ mkdir -p \
 #   Mitosis.sorted.bam CM007964.1 150000 200000 "" chr1_150000_to_200000bases.bed
 # ------------------------------------------------------------------
 
-BAM_FILE="$1"
-CHROM="$2"
-START="$3"
-END="$4"
-READ_ID="$5"
+BAM_FILE="${1:-}"
+CHROM="${2:-}"
+START="${3:-}"
+END="${4:-}"
+READ_ID="${5:-}"
 OUTPUT_NAME="${6:-${CHROM}_${START}_${END}_brdu.bed}"
 
 if [ -z "$BAM_FILE" ] || [ -z "$CHROM" ] || [ -z "$START" ] || [ -z "$END" ]; then
@@ -102,6 +105,7 @@ fi
 
 # --- Auto-detect phase label from BAM filename ---
 BAM_LOWER="$(echo "$BAM_FILE" | tr '[:upper:]' '[:lower:]')"
+
 if [[ "$BAM_LOWER" == *mitosis* ]]; then
   PHASE_LABEL="Mitosis"
 elif [[ "$BAM_LOWER" == *s_phase* ]] || [[ "$BAM_LOWER" == *sphase* ]] || [[ "$BAM_LOWER" == *s-phase* ]]; then
@@ -114,56 +118,73 @@ echo "[INFO] Phase label detected: $PHASE_LABEL"
 
 # --- Virtual environment setup ---
 VENV_DIR="$SRC_DIR/.rainplot_env"
-RENV_DIR="$SRC_DIR/.renv"
+R_ENV_DIR="$SRC_DIR/.r_library"
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "[INFO] Virtual environment not found. Creating $VENV_DIR..."
   python3 -m venv "$VENV_DIR"
+
   if [ $? -ne 0 ]; then
     echo "[ERROR] Failed to create virtual environment. Exiting."
     exit 1
   fi
+
   echo "[INFO] Virtual environment created."
 fi
 
 echo "[INFO] Activating virtual environment..."
 source "$VENV_DIR/bin/activate"
+
 if [ $? -ne 0 ]; then
   echo "[ERROR] Failed to activate virtual environment. Exiting."
   exit 1
 fi
 
-echo "[INFO] Installing required libraries from requirements.txt..."
+echo "[INFO] Installing required Python libraries from requirements.txt..."
 pip install -r "$SRC_DIR/requirements.txt" --quiet
+
 if [ $? -ne 0 ]; then
   echo "[ERROR] pip install failed. Exiting."
   deactivate
   exit 1
 fi
-echo "[INFO] Libraries installed successfully."
+
+echo "[INFO] Python libraries installed successfully."
 
 # --- Local R library setup ---
-if [ ! -d "$RENV_DIR" ]; then
-  echo "[INFO] renv project directory not found. Creating $RENV_DIR..."
-  mkdir -p "$RENV_DIR"
+if [ ! -d "$R_ENV_DIR" ]; then
+  echo "[INFO] Local R library not found. Creating $R_ENV_DIR..."
+  mkdir -p "$R_ENV_DIR"
+
   if [ $? -ne 0 ]; then
-    echo "[ERROR] Failed to create renv project directory. Exiting."
+    echo "[ERROR] Failed to create local R library directory. Exiting."
     deactivate
     exit 1
   fi
-  echo "[INFO] renv project directory created."
+
+  echo "[INFO] Local R library directory created."
 fi
 
-echo "[INFO] Ensuring renv is initialized and restored for $SRC_DIR..."
-Rscript "$SRC_DIR/ensure_r_environment.R" "$SRC_DIR"
+export R_LIBS_USER="$R_ENV_DIR"
+export WORKFLOW_ROOT="$WORKFLOW_ROOT"
+
+echo "[INFO] Ensuring local R library is ready at $R_LIBS_USER..."
+Rscript "$SRC_DIR/ensure_r_environment.R" "$R_LIBS_USER"
+
 if [ $? -ne 0 ]; then
-  echo "[ERROR] renv setup failed. Exiting."
+  echo "[ERROR] Local R library setup failed. Exiting."
   deactivate
   exit 1
 fi
-echo "[INFO] renv environment ready."
 
-# --- BrdU extraction ---
+echo "[INFO] Local R environment ready."
+
+# ------------------------------------------------------------------
+# BrdU extraction
+# This stays in the BAM coordinate system.
+# For W303 BAMs, this means BrdU output stays in W303 coordinates.
+# ------------------------------------------------------------------
+
 CMD="python $SRC_DIR/raw_data_extraction_on_bam.py $BAM -c $CHROM -s $START -e $END -o $OUTPUT"
 
 if [ -n "$READ_ID" ]; then
@@ -179,28 +200,41 @@ if [ ! -s "$OUTPUT" ]; then
   exit 1
 fi
 
-echo "[INFO] Extraction complete: $OUTPUT"
+echo "[INFO] BrdU extraction complete: $OUTPUT"
+echo "[INFO] BrdU data will remain in the BAM coordinate system."
+echo "[INFO] For W303 BAMs, this means BrdU data remains in W303 coordinates."
 
-# --- Ask user if they want LiftOver ---
+# ------------------------------------------------------------------
+# Optional UCSC chain-based LiftOver for the BrdU BED.
+# This is preserved for workflows such as sacCer3 -> sacCer1.
+# The NCBI GFF annotation plot is only valid for the native W303 path,
+# so it is skipped if the BrdU BED itself is lifted to another assembly.
+# ------------------------------------------------------------------
+
 while true; do
-  read -r -p "Would you like to do a liftover? [y/n]: " DO_LIFTOVER
+  read -r -p "Would you like to do a UCSC liftOver on the BrdU BED? [y/n]: " DO_LIFTOVER
+
   case "$DO_LIFTOVER" in
     [Yy] )
       if [ ! -x "$LIFTOVER_BIN" ]; then
         echo "[INFO] liftOver not found at $LIFTOVER_BIN"
         echo "[INFO] Downloading UCSC liftOver into $TOOLS_DIR ..."
         wget -O "$LIFTOVER_BIN" "$LIFTOVER_URL"
+
         if [ $? -ne 0 ]; then
           echo "[ERROR] Failed to download liftOver from $LIFTOVER_URL"
           deactivate
           exit 1
         fi
+
         chmod +x "$LIFTOVER_BIN"
+
         if [ $? -ne 0 ]; then
           echo "[ERROR] Failed to make liftOver executable."
           deactivate
           exit 1
         fi
+
         echo "[INFO] liftOver installed successfully at: $LIFTOVER_BIN"
       else
         echo "[INFO] Using existing liftOver binary: $LIFTOVER_BIN"
@@ -208,20 +242,23 @@ while true; do
 
       while true; do
         read -r -p "Enter the full path to the chain file: " CHAIN_PATH
+
         if [ -z "$CHAIN_PATH" ]; then
           echo "[WARN] No chain file path entered. Please try again."
           continue
         fi
+
         if [ ! -f "$CHAIN_PATH" ]; then
           echo "[WARN] Chain file not found: $CHAIN_PATH"
           continue
         fi
+
         break
       done
 
       TEMP_LIFTOVER_INPUT="$(mktemp "$BED_DIR/.liftover_input_${OUTPUT_BASENAME}_XXXXXX.bed")"
 
-      echo "[INFO] Converting BED chromosome names from GenBank to UCSC for LiftOver..."
+      echo "[INFO] Converting BED chromosome names from GenBank to UCSC for chain-based liftOver..."
       python "$UTILS_DIR/convert_genbank_bed_to_ucsc.py" "$OUTPUT" "$TEMP_LIFTOVER_INPUT"
 
       if [ ! -s "$TEMP_LIFTOVER_INPUT" ]; then
@@ -231,7 +268,7 @@ while true; do
         exit 1
       fi
 
-      echo "[INFO] Running LiftOver..."
+      echo "[INFO] Running chain-based liftOver on BrdU BED..."
       python "$UTILS_DIR/liftover.py" \
         "$TEMP_LIFTOVER_INPUT" \
         --chain "$CHAIN_PATH" \
@@ -251,24 +288,32 @@ while true; do
       USE_RFB_OVERLAY="no"
       GENERATE_GENOMIC_FEATURES="no"
 
-      echo "[INFO] LiftOver complete: $LIFTOVER_OUTPUT"
+      echo "[INFO] Chain-based LiftOver complete: $LIFTOVER_OUTPUT"
       echo "[INFO] Unmapped LiftOver intervals written to: $LIFTOVER_UNMAPPED_OUTPUT"
-      echo "[INFO] The workflow will use the lifted BED file for plotting."
-      echo "[INFO] RFB overlay will be skipped because the RFB BED file was not lifted and would be in a different coordinate system."
-      echo "[INFO] Genomic feature annotation will also be skipped because the local GFF coordinates do not match the lifted coordinate system."
+      echo "[INFO] The workflow will use the lifted BrdU BED file for plotting."
+      echo "[INFO] RFB overlay is being skipped because the RFB BED remains in the original coordinate system."
+      echo "[INFO] Genomic feature annotation is being skipped because the local W303 GFF does not match the lifted coordinate system."
       break
       ;;
+
     [Nn] )
-      echo "[INFO] LiftOver skipped. The workflow will use the original BED file for plotting."
+      echo "[INFO] UCSC liftOver skipped."
+      echo "[INFO] The workflow will continue in the original BAM/W303 coordinate system."
       break
       ;;
+
     * )
       echo "[WARN] Invalid response. Please enter 'y' or 'n'."
       ;;
   esac
 done
 
-# --- RFB extraction ---
+# ------------------------------------------------------------------
+# RFB extraction
+# This also stays in the BAM coordinate system.
+# For W303 BAMs, this means RFB output stays in W303 coordinates.
+# ------------------------------------------------------------------
+
 echo "[INFO] Running RFB motif extraction..."
 python "$SRC_DIR/rfb_seq_matcher.py" \
   "$BAM" \
@@ -283,7 +328,10 @@ else
   echo "[INFO] RFB extraction complete: $RFB_OUTPUT"
 fi
 
-# --- Generate rain plots ---
+# ------------------------------------------------------------------
+# Generate rain plots
+# ------------------------------------------------------------------
+
 echo "[INFO] Generating rain plots..."
 
 if [ "$USE_RFB_OVERLAY" = "yes" ]; then
@@ -317,20 +365,27 @@ if [ ! -s "$RAINPLOT_MANIFEST" ]; then
   exit 1
 fi
 
+# ------------------------------------------------------------------
+# Generate genomic feature plot from the local W303 NCBI GFF.
+# ------------------------------------------------------------------
+
 if [ "$GENERATE_GENOMIC_FEATURES" = "yes" ]; then
-  if [ ! -f "$GFF_FILE" ]; then
-    echo "[ERROR] Genomic annotation file not found: $GFF_FILE"
+  if [ ! -s "$NCBI_GFF" ]; then
+    echo "[ERROR] NCBI GFF annotation file not found:"
+    echo "$NCBI_GFF"
     deactivate
     exit 1
   fi
 
-  echo "[INFO] Generating genomic feature plot with Gviz..."
+  echo "[INFO] Generating genomic feature plot from local W303 NCBI GFF..."
+  echo "[INFO] Using GFF: $NCBI_GFF"
+
   Rscript "$SRC_DIR/genomic_feature_plot.R" \
-    "$GFF_FILE" \
     "$CHROM" \
     "$START" \
     "$END" \
-    "$GENOMIC_FEATURE_PNG"
+    "$GENOMIC_FEATURE_PNG" \
+    "$NCBI_GFF"
 
   if [ $? -ne 0 ] || [ ! -s "$GENOMIC_FEATURE_PNG" ]; then
     echo "[ERROR] Genomic feature plot generation failed."
@@ -362,3 +417,4 @@ rm -f "$RAINPLOT_MANIFEST"
 
 deactivate
 echo "[INFO] Virtual environment deactivated."
+echo "[INFO] Workflow complete."

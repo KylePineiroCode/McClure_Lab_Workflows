@@ -73,6 +73,11 @@ def get_output_dir(output_dir=None):
     return output_dir
 
 
+def get_region_metadata_path(output_dir):
+    """Path for per-rainplot genomic window metadata."""
+    return os.path.join(output_dir, "rainplot_regions.tsv")
+
+
 # Map GenBank IDs to chromosome numbers
 genbank_to_chr = {
     "CM007964.1": "1",
@@ -208,6 +213,7 @@ def plot_rainplots_per_read(
     df = df[df["read_id"].isin(sampled_reads)]
 
     generated_paths = []
+    region_records = []
 
     for i, (rid, sub) in enumerate(df.groupby("read_id", sort=False), start=1):
         if i > max_reads:
@@ -223,8 +229,14 @@ def plot_rainplots_per_read(
                 genbank_to_chr.get(g, g) for g in genbank_ids
             )
 
-        read_start = sub["start"].min()
-        x = (sub["start"].to_numpy() - read_start) / 1000.0
+        read_start = int(sub["start"].min())
+        if "end" in sub.columns:
+            sub["end"] = pd.to_numeric(sub["end"], errors="coerce", downcast="integer")
+        read_end = int(sub["end"].dropna().max()) if sub["end"].notna().any() else int(sub["start"].max())
+        if read_end <= read_start:
+            read_end = read_start + 1
+
+        x = sub["start"].to_numpy(dtype=float) / 1000.0
         y = sub["mod_prob"].to_numpy(dtype=float)
         bases = sub["mod_base"].to_numpy(dtype=object)
 
@@ -289,7 +301,7 @@ def plot_rainplots_per_read(
         # Draw red vertical line at each RFB motif start position for this read
         if rid in rfb_positions:
             for rfb_start in rfb_positions[rid]:
-                rfb_x = (rfb_start - read_start) / 1000.0
+                rfb_x = rfb_start / 1000.0
                 ax.axvline(
                     x=rfb_x,
                     color="red",
@@ -303,9 +315,13 @@ def plot_rainplots_per_read(
             ax.legend([handles[0]], [labels[0]], loc="upper right")
 
         ax.set_ylim(0, 1)
-        ax.set_xlabel("Position within read (kb)")
+        ax.set_xlim(read_start / 1000.0, read_end / 1000.0)
+        ax.set_xlabel("Genomic position (kb)")
         ax.set_ylabel("BrdU incorporation rate (0–1)")
-        ax.set_title(f"{phase} Rain Plot {rid} - Read {i}\nChromosome: {chr_label}")
+        ax.set_title(
+            f"{phase} Rain Plot {rid} - Read {i}\n"
+            f"Chromosome: {chr_label} | Window: {read_start}-{read_end} bp"
+        )
 
         outpath = os.path.join(
             outdir,
@@ -316,11 +332,26 @@ def plot_rainplots_per_read(
         fig.savefig(outpath, dpi=200)
         plt.close(fig)
         generated_paths.append(outpath)
+        region_records.append(
+            {
+                "rainplot_path": outpath,
+                "chrom": genbank_ids[0] if len(genbank_ids) == 1 else str(genbank_ids[0]),
+                "read_start": read_start,
+                "read_end": read_end,
+            }
+        )
 
     if output_manifest:
         with open(output_manifest, "w", encoding="utf-8") as handle:
             for path in generated_paths:
                 handle.write(f"{path}\n")
+
+    if region_records:
+        pd.DataFrame(region_records).to_csv(
+            get_region_metadata_path(outdir),
+            sep="\t",
+            index=False
+        )
 
 
 if __name__ == "__main__":

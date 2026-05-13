@@ -2,58 +2,62 @@
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) != 1) {
-  stop("Usage: ensure_r_environment.R <project_dir>", call. = FALSE)
+  stop("Usage: ensure_r_environment.R <library_dir>", call. = FALSE)
 }
 
-project_dir <- normalizePath(args[[1]], winslash = "/", mustWork = TRUE)
-setwd(project_dir)
+library_dir <- normalizePath(args[[1]], winslash = "/", mustWork = FALSE)
+dir.create(library_dir, recursive = TRUE, showWarnings = FALSE)
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-Sys.setenv(
-  RENV_CONFIG_AUTOLOADER_ENABLED = "FALSE",
-  RENV_CONSENT = "yes"
+.libPaths(c(library_dir, .libPaths()))
+
+required_packages <- c(
+  "BiocManager",
+  "Gviz",
+  "rtracklayer",
+  "GenomicRanges",
+  "GenomeInfoDb"
 )
 
-required_packages <- c("BiocManager", "Gviz", "rtracklayer", "GenomicRanges")
-lockfile_path <- file.path(project_dir, "renv.lock")
-activate_path <- file.path(project_dir, "renv", "activate.R")
-
-if (!requireNamespace("renv", quietly = TRUE)) {
-  message("[INFO] Installing renv...")
-  install.packages("renv", repos = "https://cloud.r-project.org")
+is_installed_in_library <- function(pkg) {
+  pkg_path <- suppressWarnings(
+    find.package(pkg, lib.loc = library_dir, quiet = TRUE)
+  )
+  length(pkg_path) > 0 && nzchar(pkg_path)
 }
 
-renv::consent(provided = TRUE)
-
-if (!file.exists(activate_path)) {
-  message("[INFO] Initializing renv project...")
-  renv::init(bare = TRUE, restart = FALSE)
-} else {
-  message("[INFO] renv project already initialized.")
+if (!is_installed_in_library("BiocManager")) {
+  message("[INFO] Installing BiocManager into the local R library...")
+  install.packages(
+    "BiocManager",
+    repos = "https://cloud.r-project.org",
+    lib = library_dir
+  )
 }
 
-if (file.exists(lockfile_path)) {
-  message("[INFO] Restoring R packages from renv.lock...")
-  renv::restore(prompt = FALSE)
-} else {
-  message("[INFO] No renv.lock found yet. A new one will be created after package installation.")
-}
+options(repos = BiocManager::repositories())
 
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+missing_bioc_packages <- required_packages[required_packages != "BiocManager"][
+  !vapply(
+    required_packages[required_packages != "BiocManager"],
+    is_installed_in_library,
+    logical(1)
+  )
 ]
 
-if (length(missing_packages) > 0) {
+if (length(missing_bioc_packages) > 0) {
   message(sprintf(
-    "[INFO] Installing missing renv packages: %s",
-    paste(missing_packages, collapse = ", ")
+    "[INFO] Installing missing R packages into the local R library: %s",
+    paste(missing_bioc_packages, collapse = ", ")
   ))
-  renv::install(missing_packages)
+  BiocManager::install(
+    missing_bioc_packages,
+    ask = FALSE,
+    update = FALSE,
+    lib = library_dir,
+    force = TRUE
+  )
 } else {
-  message("[INFO] Required R packages already available in renv.")
+  message("[INFO] Required R packages already installed in the local R library.")
 }
 
-message("[INFO] Snapshotting renv.lock...")
-renv::snapshot(prompt = FALSE)
-
-message(sprintf("[INFO] renv ready in: %s", project_dir))
+message(sprintf("[INFO] Local R library ready: %s", library_dir))
