@@ -13,3 +13,7 @@ data
 
 # Ignore the __pycache__
 __pycache__
+
+# Ignore the .codex and .agents
+.codex
+.agents
