@@ -58,7 +58,7 @@ if [ -z "$BAM_FILE" ] || [ -z "$CHROM" ] || [ -z "$START" ] || [ -z "$END" ]; th
 fi
 
 PHASE_LABEL=""
-RFB_PLOT_MODE="mixed"
+RFB_PLOT_MODE="none"
 FILTER_RFB_READS="no"
 REQUEST_RFB_OVERLAY="yes"
 ENABLE_RFB_WORKFLOW="no"
@@ -69,7 +69,7 @@ while true; do
   case "$PHASE_CHOICE" in
     [Mm] )
       PHASE_LABEL="Mitosis"
-      RFB_PLOT_MODE="mixed"
+      RFB_PLOT_MODE="none"
       FILTER_RFB_READS="no"
       REQUEST_RFB_OVERLAY="no"
       ENABLE_RFB_WORKFLOW="no"
