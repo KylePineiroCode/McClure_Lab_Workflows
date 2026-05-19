@@ -1,5 +1,17 @@
 #!/usr/bin/env Rscript
 
+# This script generates genomic annotation PNGs for a requested genomic region.
+# It supports annotation files in GFF/GFF3 or BED format and can also overlay
+# G4 motif calls from a separate BED file.
+#
+# Main purpose:
+#   - Read genes/features from an annotation file.
+#   - Filter them to the requested chromosome and coordinate window.
+#   - Normalize feature names/types so the plot is readable.
+#   - Draw a genomic-style ruler showing where each feature occurs.
+#
+# The output PNG is later stacked underneath the rain plot.
+
 script_arg <- commandArgs(trailingOnly = FALSE)[grep("^--file=", commandArgs(trailingOnly = FALSE))]
 if (length(script_arg) == 1) {
   script_dir <- dirname(normalizePath(sub("^--file=", "", script_arg)))
@@ -8,17 +20,34 @@ if (length(script_arg) == 1) {
 }
 
 workflow_root <- dirname(dirname(script_dir))
-g4_bed_file <- file.path(workflow_root, "data", "bed", "g4.motifs.bed")
+
+# The G4 BED file can be supplied through the G4_BED_FILE environment variable.
+# If it is not supplied, the script falls back to the expected workflow location.
+g4_bed_file <- Sys.getenv(
+  "G4_BED_FILE",
+  unset = file.path(workflow_root, "data", "bed", "g4.motifs.bed")
+)
 
 local_r_library <- Sys.getenv("R_LIBS_USER", unset = "")
 if (!nzchar(local_r_library)) {
   local_r_library <- file.path(script_dir, ".r_library")
 }
 
+# Put the workflow-specific R library first so this script uses the packages
+# installed for this pipeline instead of accidentally using a system library.
 .libPaths(c(local_r_library, .libPaths()))
 
 required_pkgs <- c("Gviz", "GenomicRanges")
-missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE, lib.loc = local_r_library)]
+
+missing_pkgs <- required_pkgs[
+  !vapply(
+    required_pkgs,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE,
+    lib.loc = local_r_library
+  )
+]
 
 if (length(missing_pkgs) > 0) {
   stop(
@@ -37,9 +66,9 @@ suppressWarnings(suppressMessages({
 }))
 
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 5) {
+if (!length(args) %in% c(5, 6)) {
   stop(
-    "Usage: genomic_feature_plot.R <chrom> <start> <end> <output_png> <ncbi_gff>",
+    "Usage: genomic_feature_plot.R <chrom> <start> <end> <output_png> <annotation_file> [annotation_label]",
     call. = FALSE
   )
 }
@@ -48,16 +77,23 @@ chrom_input <- args[[1]]
 region_start <- as.integer(args[[2]])
 region_end <- as.integer(args[[3]])
 output_png <- args[[4]]
-gff_file <- args[[5]]
+annotation_file <- args[[5]]
+annotation_label <- if (length(args) >= 6) args[[6]] else "Annotation"
 
 if (is.na(region_start) || is.na(region_end) || region_start > region_end) {
   stop("Start and end coordinates must be valid integers with start <= end.", call. = FALSE)
 }
 
-if (!file.exists(gff_file)) {
-  stop(sprintf("NCBI GFF file not found: %s", gff_file), call. = FALSE)
+if (!file.exists(annotation_file)) {
+  stop(sprintf("Annotation file not found: %s", annotation_file), call. = FALSE)
 }
 
+# This lookup table converts different chromosome naming styles into the UCSC
+# style expected by the plotting code, such as chrI, chrII, chrIII, etc.
+#
+# The workflow may receive chromosome names from BAM files, NCBI files, UCSC
+# annotations, or user input. Those sources do not always use the same naming
+# system, so we normalize them before filtering features.
 seq_aliases <- c(
   "CM007964.1" = "chrI",
   "CM007965.1" = "chrII",
@@ -149,26 +185,36 @@ seq_aliases <- c(
 )
 
 resolve_chromosome <- function(chrom) {
+  # Try an exact match first because accession IDs and UCSC names are
+  # case-sensitive in some contexts.
   resolved <- unname(seq_aliases[chrom])
   if (length(resolved) > 0 && !is.na(resolved[[1]])) {
     return(resolved[[1]])
   }
 
+  # Try lowercase next so user input like chrI, chri, or CHRI can still resolve.
   chrom_lower <- tolower(chrom)
   resolved <- unname(seq_aliases[chrom_lower])
   if (length(resolved) > 0 && !is.na(resolved[[1]])) {
     return(resolved[[1]])
   }
 
+  # If the value already starts with "chr" but was not in the lookup table,
+  # keep the chr prefix and standardize the suffix to uppercase.
   if (grepl("^chr", chrom, ignore.case = TRUE)) {
     suffix <- sub("^chr", "", chrom, ignore.case = TRUE)
     return(paste0("chr", toupper(suffix)))
   }
 
+  # Final fallback: add chr to the front. This lets simple inputs like "I" or
+  # "XII" still become valid UCSC-style chromosome names.
   paste0("chr", chrom)
 }
 
 parse_attributes <- function(attr_string) {
+  # GFF/GFF3 stores feature metadata in the 9th column, usually as key=value
+  # pairs separated by semicolons. Some files use key "value" instead, so this
+  # parser handles both formats.
   attrs <- list()
   if (!nzchar(attr_string)) {
     return(attrs)
@@ -206,6 +252,8 @@ first_non_empty <- function(values) {
 }
 
 note_token <- function(attrs) {
+  # Some feature descriptions contain several semicolon-separated notes.
+  # For plot labels, the first note is usually the cleanest and shortest.
   note_value <- first_non_empty(c(attrs[["Note"]], attrs[["description"]]))
   if (is.na(note_value)) {
     return(NA_character_)
@@ -215,6 +263,8 @@ note_token <- function(attrs) {
 }
 
 normalize_feature_type <- function(feature_type) {
+  # Long terminal repeats are treated as repeat regions so they appear in the
+  # same plot group/color as other repeat annotations.
   if (feature_type == "long_terminal_repeat") {
     return("repeat_region")
   }
@@ -222,6 +272,8 @@ normalize_feature_type <- function(feature_type) {
 }
 
 choose_feature_name <- function(feature_type, attrs) {
+  # Different annotation sources store useful labels under different fields.
+  # These priority lists choose the most readable name available for each type.
   if (feature_type == "gene") {
     return(first_non_empty(c(attrs[["Name"]], attrs[["gene"]], attrs[["locus_tag"]], attrs[["ID"]], "Gene")))
   }
@@ -238,6 +290,8 @@ choose_feature_name <- function(feature_type, attrs) {
 }
 
 keep_feature_row <- function(feature_type, attrs) {
+  # Only keep feature types that are useful for this annotation track.
+  # This avoids cluttering the plot with every possible GFF entry.
   wanted <- c(
     "gene",
     "tRNA",
@@ -256,6 +310,9 @@ keep_feature_row <- function(feature_type, attrs) {
     return(FALSE)
   }
 
+  # Some GFF files store tRNAs/rRNAs/ncRNAs as rows with feature_type = "gene"
+  # and a gene_biotype field. We skip those here so they do not get duplicated
+  # as both a gene and a non-coding RNA feature.
   if (feature_type == "gene") {
     gene_biotype <- first_non_empty(c(attrs[["gene_biotype"]], ""))
     if (gene_biotype %in% c("tRNA", "rRNA", "ncRNA", "snoRNA", "snRNA")) {
@@ -263,6 +320,9 @@ keep_feature_row <- function(feature_type, attrs) {
     }
   }
 
+  # Centromeres may be split into smaller CDEI/CDEII/CDEIII subregions.
+  # Skipping those keeps the plot cleaner and avoids showing multiple tiny
+  # centromere parts instead of the main centromere annotation.
   if (feature_type == "centromere") {
     note_value <- first_non_empty(c(attrs[["Note"]], ""))
     if (grepl("CDEI|CDEII|CDEIII", note_value)) {
@@ -277,9 +337,9 @@ make_placeholder_plot <- function(message_text, plot_start, plot_end, outpath) {
   png(outpath, width = 3200, height = 900, res = 200)
   par(mar = c(1, 1, 2, 1))
   plot.new()
-  title(main = sprintf("W303 NCBI annotations: %s:%s-%s", chrom_input, plot_start, plot_end))
+  title(main = sprintf("%s annotations: %s:%s-%s", annotation_label, chrom_input, plot_start, plot_end))
   text(0.5, 0.55, message_text, cex = 1.05)
-  text(0.5, 0.42, sprintf("Annotation source: %s", basename(gff_file)), cex = 0.9)
+  text(0.5, 0.42, sprintf("Annotation source: %s", basename(annotation_file)), cex = 0.9)
   dev.off()
 }
 
@@ -291,6 +351,8 @@ read_features_from_gff <- function(path, requested_chrom, region_start, region_e
   row_index <- 1L
 
   repeat {
+    # Read the GFF in chunks so large annotation files do not have to be loaded
+    # into memory all at once.
     lines <- readLines(con, n = 50000, warn = FALSE)
     if (length(lines) == 0) {
       break
@@ -324,8 +386,13 @@ read_features_from_gff <- function(path, requested_chrom, region_start, region_e
         next
       }
 
+      # GFF coordinates are 1-based and inclusive.
+      # The rest of this workflow uses BED-style 0-based starts and half-open
+      # intervals, so subtract 1 from the start but leave the end as-is.
       feature_start <- start_1based - 1L
       feature_end <- end_1based
+
+      # Keep only features that overlap the requested region.
       if (feature_end <= region_start || feature_start >= region_end) {
         next
       }
@@ -361,6 +428,81 @@ read_features_from_gff <- function(path, requested_chrom, region_start, region_e
   features
 }
 
+read_features_from_bed <- function(path, requested_chrom, region_start, region_end) {
+  feature_df <- tryCatch(
+    read.delim(path, header = FALSE, stringsAsFactors = FALSE),
+    error = function(e) data.frame()
+  )
+
+  if (nrow(feature_df) == 0 || ncol(feature_df) < 3) {
+    return(data.frame())
+  }
+
+  # BED files may have only the required 3 columns or may include extra columns.
+  # The first six columns are interpreted as chrom, start, end, name, type, strand
+  # when available.
+  base_cols <- c("chrom", "start", "end", "name", "feature_type", "strand")
+  colnames(feature_df)[seq_len(min(length(base_cols), ncol(feature_df)))] <- base_cols[seq_len(min(length(base_cols), ncol(feature_df)))]
+
+  if (!"name" %in% colnames(feature_df)) {
+    feature_df$name <- paste0("feature_", seq_len(nrow(feature_df)))
+  }
+  if (!"feature_type" %in% colnames(feature_df)) {
+    feature_df$feature_type <- "gene"
+  }
+  if (!"strand" %in% colnames(feature_df)) {
+    feature_df$strand <- "*"
+  }
+
+  feature_df$start <- suppressWarnings(as.integer(feature_df$start))
+  feature_df$end <- suppressWarnings(as.integer(feature_df$end))
+  feature_df <- feature_df[!is.na(feature_df$start) & !is.na(feature_df$end), , drop = FALSE]
+  if (nrow(feature_df) == 0) {
+    return(data.frame())
+  }
+
+  keep <- vapply(feature_df$chrom, resolve_chromosome, character(1)) == requested_chrom
+  feature_df <- feature_df[keep, , drop = FALSE]
+  if (nrow(feature_df) == 0) {
+    return(data.frame())
+  }
+
+  feature_df <- feature_df[feature_df$end > region_start & feature_df$start < region_end, , drop = FALSE]
+  if (nrow(feature_df) == 0) {
+    return(data.frame())
+  }
+
+  feature_df$strand[!feature_df$strand %in% c("+", "-")] <- "*"
+  feature_df$feature_type <- vapply(feature_df$feature_type, normalize_feature_type, character(1))
+  feature_df <- feature_df[vapply(feature_df$feature_type, function(x) keep_feature_row(x, list()), logical(1)), , drop = FALSE]
+  if (nrow(feature_df) == 0) {
+    return(data.frame())
+  }
+
+  data.frame(
+    chrom = requested_chrom,
+    start = pmax(region_start, feature_df$start),
+    end = pmin(region_end, feature_df$end),
+    raw_start = feature_df$start,
+    raw_end = feature_df$end,
+    name = feature_df$name,
+    strand = feature_df$strand,
+    feature_type = feature_df$feature_type,
+    stringsAsFactors = FALSE
+  )
+}
+
+read_features <- function(path, requested_chrom, region_start, region_end) {
+  # Decide which parser to use based on the file extension.
+  path_lower <- tolower(path)
+  if (grepl("\\.(gff|gff3)(\\.gz)?$", path_lower)) {
+    return(read_features_from_gff(path, requested_chrom, region_start, region_end))
+  }
+  read_features_from_bed(path, requested_chrom, region_start, region_end)
+}
+
+# Ranking controls the order of rows in the plot and the legend.
+# Lower numbers are drawn first/higher priority.
 feature_rank <- c(
   "gene" = 1,
   "origin_of_replication" = 2,
@@ -415,6 +557,7 @@ feature_type_label <- function(feature_type) {
 }
 
 is_directional_feature <- function(feature_type, strand_values) {
+  # Only draw strand arrows for features where direction is biologically useful.
   has_strand <- any(strand_values %in% c("+", "-"))
   feature_type %in% c(
     "gene",
@@ -432,6 +575,8 @@ draw_direction_backdrop <- function(region_start, region_end, y, strand_value, c
     return(invisible(NULL))
   }
 
+  # Spread faint arrows across the whole row so the viewer can quickly see the
+  # direction of the feature without needing a separate strand label.
   step <- max(400L, ceiling(region_span / 32))
   arrow_len <- step * 0.7
   centers <- seq(region_start + step / 2, region_end - step / 2, by = step)
@@ -469,6 +614,8 @@ draw_feature_ruler <- function(feature_row, y, region_start, region_end, region_
   label_y <- y + 0.21
   tick_half_height <- 0.16
 
+  # Draw the full region ruler first, then draw the actual feature coordinates
+  # as a colored segment on top of that ruler.
   segments(region_start, y, region_end, y, col = ruler_color, lwd = 1)
 
   if (is_directional_feature(feature_type, strand_value)) {
@@ -489,6 +636,8 @@ draw_feature_ruler <- function(feature_row, y, region_start, region_end, region_
     lwd = 2.2
   )
 
+  # Very small features can be hard to see as horizontal segments, so add a
+  # vertical marker when the feature is tiny relative to the plotted region.
   if (feature_width < max(2L, ceiling(region_span * 0.0015))) {
     center_x <- (feature_start + feature_end) / 2
     segments(center_x, y - 0.22, center_x, y + 0.22, col = track_color, lwd = 2.4)
@@ -598,12 +747,12 @@ draw_g4_ruler <- function(g4_df, y, region_start, region_end) {
 
 render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chrom_input) {
   requested_chrom <- resolve_chromosome(plot_chrom)
-  feature_df <- read_features_from_gff(gff_file, requested_chrom, plot_start, plot_end)
+  feature_df <- read_features(annotation_file, requested_chrom, plot_start, plot_end)
   g4_df <- read_g4_from_bed(g4_bed_file, requested_chrom, plot_start, plot_end)
 
   if (nrow(feature_df) == 0 && nrow(g4_df) == 0) {
     make_placeholder_plot(
-      "No genes, genomic features, or G4 motifs were found in the requested W303 region.",
+      "No genes, genomic features, or G4 motifs were found in the requested region.",
       plot_start,
       plot_end,
       outpath
@@ -611,12 +760,16 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
     return(invisible(NULL))
   }
 
+  # Sort features by biological category first, then genomic position.
+  # This keeps similar feature types grouped together in the final figure.
   feature_order <- unname(feature_rank[feature_df$feature_type])
   feature_order[is.na(feature_order)] <- 999L
 
   feature_df <- feature_df[order(feature_order, feature_df$raw_start, feature_df$raw_end, feature_df$name), ]
   rownames(feature_df) <- NULL
 
+  # Make the PNG taller as more annotation rows are added.
+  # This prevents labels from being squeezed together in dense regions.
   region_span <- max(1L, plot_end - plot_start + 1L)
   extra_rows <- if (nrow(g4_df) > 0) 1L else 0L
   total_rows <- nrow(feature_df) + extra_rows
@@ -642,7 +795,8 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
 
   title(
     main = sprintf(
-      "W303 NCBI annotations: %s:%s-%s",
+      "%s annotations: %s:%s-%s",
+      annotation_label,
       plot_chrom,
       plot_start,
       plot_end
@@ -670,9 +824,12 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
   legend_order[is.na(legend_order)] <- 999L
   legend_types <- legend_types[order(legend_order, legend_types)]
 
+  # Light vertical gridlines help line up feature positions with the coordinate
+  # ruler without overpowering the annotation tracks.
   abline(v = axis_ticks, col = "#EAEAEA", lwd = 0.8)
 
   if (nrow(feature_df) > 0) {
+    # Reverse the y positions so the first sorted feature appears near the top.
     feature_y_positions <- rev(seq(from = 1L + extra_rows, length.out = nrow(feature_df)))
     invisible(lapply(seq_len(nrow(feature_df)), function(i) {
       draw_feature_ruler(
@@ -728,6 +885,10 @@ if (file.exists(metadata_path)) {
         dirname(rainplot_path),
         sub("^rainplot_", "annotation_", basename(rainplot_path))
       )
+
+      # When rain plots are generated for individual reads, this metadata file
+      # lets each annotation PNG use the exact read-level window instead of the
+      # larger original region.
       plot_chrom <- first_non_empty(c(region_df$chrom[[i]], chrom_input))
       plot_start <- as.integer(region_df$read_start[[i]])
       plot_end <- as.integer(region_df$read_end[[i]])
@@ -741,6 +902,8 @@ if (file.exists(metadata_path)) {
 
       render_feature_plot(plot_start, plot_end, annotation_path, plot_chrom)
 
+      # Also write the first annotation plot to the main output path so older
+      # parts of the workflow that expect a single annotation PNG still work.
       if (i == 1L) {
         render_feature_plot(plot_start, plot_end, output_png, plot_chrom)
       }
@@ -752,4 +915,6 @@ if (file.exists(metadata_path)) {
   }
 }
 
+# Fallback behavior: if no read-level metadata exists, render the annotation
+# track for the original region passed on the command line.
 render_feature_plot(region_start, region_end, output_png, chrom_input)

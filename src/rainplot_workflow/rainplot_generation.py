@@ -51,6 +51,22 @@ def parse_args():
         default=None,
         help="Optional file to write the generated rain plot PNG paths to"
     )
+    parser.add_argument(
+        "--filename_prefix",
+        required=False,
+        default=None,
+        help="Optional prefix to use in generated rain plot PNG filenames"
+    )
+    parser.add_argument(
+        "--filter_reads_with_rfb",
+        action="store_true",
+        help="Plot only reads that have matching RFB coordinates"
+    )
+    parser.add_argument(
+        "--show_rfb_overlay",
+        action="store_true",
+        help="Draw RFB coordinate markers on the rain plots"
+    )
     return parser.parse_args()
 
 
@@ -140,35 +156,22 @@ def load_rfb_positions(rfb_dir, region_start, region_end):
     return rfb_positions
 
 
-# -------------------------------------------------------------------------
-# OPTIONAL FILTER: Plot only reads that contain RFB coords
-#
-# This function filters the dataframe to only include reads that have been
-# identified as containing the RFB motif sequence. This is useful when
-# analysing S phase data where you only want to visualise reads that
-# overlap with the replication fork barrier. To enable this filter:
-#
-# 1. Uncomment the function below
-# 2. Uncomment the call to filter_reads_with_rfb() in
-#    plot_rainplots_per_read() (marked below with UNCOMMENT TO ENABLE)
-#
-# When enabled, only reads present in the RFB .bed file will be plotted.
-# Reads without RFB coords will be skipped entirely.
-# -------------------------------------------------------------------------
+def filter_reads_with_rfb(df, rfb_positions):
+    """
+    Filter the dataframe to only include reads that contain RFB coords.
+    Returns a filtered dataframe containing only reads with RFB motif matches.
+    """
+    if not rfb_positions:
+        print("[WARN] No RFB positions loaded; skipping RFB-only read filter.", flush=True)
+        return df
 
-# def filter_reads_with_rfb(df, rfb_positions):
-#     """
-#    Filter the dataframe to only include reads that contain RFB coords.
-#     Returns a filtered dataframe containing only reads with RFB motif matches.
-#     """
-#     if not rfb_positions:
-#         print("[WARN] No RFB positions loaded — skipping RFB filter.", flush=True)
-#        return df
-
-#     rfb_read_ids = set(rfb_positions.keys())
-#     df_filtered = df[df["read_id"].isin(rfb_read_ids)]
-#     print(f"[INFO] {df_filtered['read_id'].nunique()} reads remaining after RFB filter.", flush=True)
-#     return df_filtered
+    rfb_read_ids = set(rfb_positions.keys())
+    df_filtered = df[df["read_id"].isin(rfb_read_ids)]
+    print(
+        f"[INFO] {df_filtered['read_id'].nunique()} reads remaining after RFB filter.",
+        flush=True
+    )
+    return df_filtered
 
 
 def plot_rainplots_per_read(
@@ -178,7 +181,10 @@ def plot_rainplots_per_read(
     region_end=None,
     rfb_dir=None,
     phase="Unknown",
-    output_manifest=None
+    output_manifest=None,
+    filename_prefix=None,
+    filter_reads_with_rfb_only=False,
+    show_rfb_overlay=False
 ):
     df = load_rain_plot_input(input_file)
     outdir = get_output_dir(output_dir)
@@ -199,8 +205,8 @@ def plot_rainplots_per_read(
     # Load RFB positions per read
     rfb_positions = load_rfb_positions(rfb_dir, region_start, region_end)
 
-    # UNCOMMENT TO ENABLE: Filter to only plot reads that contain RFB coords
-    # df = filter_reads_with_rfb(df, rfb_positions)
+    if filter_reads_with_rfb_only:
+        df = filter_reads_with_rfb(df, rfb_positions)
 
     # Get all unique reads with no filtering
     all_read_ids = df["read_id"].unique()
@@ -299,7 +305,7 @@ def plot_rainplots_per_read(
         ax.stairs(y_vals, edges, linewidth=2, color="black", fill=False)
 
         # Draw red vertical line at each RFB motif start position for this read
-        if rid in rfb_positions:
+        if show_rfb_overlay and rid in rfb_positions:
             for rfb_start in rfb_positions[rid]:
                 rfb_x = rfb_start / 1000.0
                 ax.axvline(
@@ -323,10 +329,12 @@ def plot_rainplots_per_read(
             f"Chromosome: {chr_label} | Window: {read_start}-{read_end} bp"
         )
 
-        outpath = os.path.join(
-            outdir,
-            f"rainplot_chr{chr_label}_{region_start}_{region_end}_{i:03d}.png"
-        )
+        if filename_prefix:
+            output_name = f"rainplot_{filename_prefix}_{i:03d}.png"
+        else:
+            output_name = f"rainplot_chr{chr_label}_{region_start}_{region_end}_{i:03d}.png"
+
+        outpath = os.path.join(outdir, output_name)
 
         fig.tight_layout()
         fig.savefig(outpath, dpi=200)
@@ -347,8 +355,18 @@ def plot_rainplots_per_read(
                 handle.write(f"{path}\n")
 
     if region_records:
-        pd.DataFrame(region_records).to_csv(
-            get_region_metadata_path(outdir),
+        metadata_path = get_region_metadata_path(outdir)
+        region_df = pd.DataFrame(region_records)
+
+        if os.path.exists(metadata_path):
+            existing_region_df = pd.read_csv(metadata_path, sep="\t")
+            region_df = pd.concat(
+                [existing_region_df, region_df],
+                ignore_index=True
+            ).drop_duplicates(subset=["rainplot_path"], keep="last")
+
+        region_df.to_csv(
+            metadata_path,
             sep="\t",
             index=False
         )
@@ -363,5 +381,8 @@ if __name__ == "__main__":
         args.region_end,
         args.rfb_dir,
         args.phase,
-        args.output_manifest
+        args.output_manifest,
+        args.filename_prefix,
+        args.filter_reads_with_rfb,
+        args.show_rfb_overlay
     )
